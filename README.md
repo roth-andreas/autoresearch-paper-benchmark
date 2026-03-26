@@ -132,12 +132,14 @@ The models should follow the ideas of this paper: https://arxiv.org/abs/2505.113
 
 If your agent supports permission modes, restricted mode is a good default while you are getting comfortable with the workflow.
 
+The intended research style is adaptive, not a fixed preplanned sweep. After each experiment, the agent should inspect the result, update its view of what seems promising, and then decide the next change in [`train.py`](train.py). The default should not be to hardcode dozens of future experiment configs or auto-run the full campaign as one large hyperparameter grid.
+
 The expected flow is:
 
 1. The agent reads `README.md`, `prepare.py`, `train.py`, and `program.md`.
 2. The agent bootstraps or activates a paper campaign.
 3. The agent runs the baseline first.
-4. The agent iterates on `train.py` with paper-aligned changes.
+4. The agent iterates on `train.py` with paper-aligned changes chosen from the paper plus the results seen so far.
 5. The agent logs one validation result per experiment.
 6. After the campaign reaches its target count, the agent runs the one-shot final test.
 
@@ -188,12 +190,19 @@ You can override the shared state location with `AUTORESEARCH_SHARED_DIR`, but t
 Inside a campaign worktree:
 
 1. Run the untouched baseline first.
-2. Implement one paper-driven change in [`train.py`](train.py).
+2. Implement the current best paper-driven change in [`train.py`](train.py).
 3. Run `uv run python train.py`.
 4. Read the reported `Selected candidate`, `Params k`, `Artifact path`, and `Final val`.
 5. Log one experiment row with `prepare.py log-result`.
-6. Repeat until the campaign reaches its target count.
+6. Decide the next change only after reading the current result, then repeat until the campaign reaches its target count.
 7. Finalize the holdout test once.
+
+The campaign should mostly look like iterative research, not a blind search:
+
+- early experiments should be willing to make larger architectural or training-process changes when the paper suggests them
+- later experiments can narrow in with smaller follow-up changes once a strong direction appears
+- small paper-motivated sweeps are allowed, but they should support one local hypothesis rather than replace the overall adaptive loop
+- do not precommit to a full 50-experiment schedule up front unless the user explicitly asks for that style
 
 Example logging command:
 

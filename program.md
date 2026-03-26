@@ -71,23 +71,33 @@ If the environment uses `uv`, run the same commands through `uv run`.
 ## Experiment Discipline
 
 Every logged row should represent one conceptual experiment, not every inner candidate sweep.
+The next experiment should usually be chosen only after inspecting the previous result.
+Do not turn the campaign into a fixed 50-run hyperparameter grid unless the user explicitly asks for that.
 
 Within one active campaign:
 
 1. Run the untouched baseline first.
-2. Make one paper-driven change in [`train.py`](train.py).
+2. Make the paper-driven change in [`train.py`](train.py) that currently seems most promising.
 3. Run `python train.py`.
 4. Capture the reported validation result and artifact path.
 5. Log one row with `prepare.py log-result`.
-6. Continue from the strongest validation idea.
+6. Use the paper plus the latest results to decide the next change.
 7. Repeat until the campaign reaches its target experiment count, usually 50.
 
 Stay paper-aligned:
 
 - transfer the paper's central mechanism, normalization, routing, fusion, aggregation, or readout ideas
-- test small paper-motivated sweeps when needed
+- prefer larger architectural or training-process changes early when they are paper-motivated
+- use small paper-motivated sweeps only when they help refine a promising current idea
 - avoid unrelated architecture churn
 - never use test AP to choose the next experiment
+
+Avoid defaulting to a predeclared experiment catalog:
+
+- do not hardcode dozens of future experiment ids or configs and then execute them blindly
+- do not let automation choose future experiments without first considering the newest validation evidence
+- helper scripts for setup or logging are fine, but they should not replace iterative research judgment
+- if you do run an inner sweep inside one experiment, keep it tightly scoped and describe the shared hypothesis in the logged row
 
 ## Logging
 
