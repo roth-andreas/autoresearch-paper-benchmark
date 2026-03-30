@@ -39,7 +39,7 @@ LOCK_FILENAME = '.ledger.lock'
 TRAIN_SNAPSHOT_NAME = 'train_snapshot.py'
 CHECKPOINT_SUMMARY_NAME = 'checkpoint_summary.json'
 FINAL_TEST_SUMMARY_NAME = 'final_test_summary.json'
-DEFAULT_BASELINE_REF = 'neutral-baseline'
+DEFAULT_BASELINE_REF = 'main'
 DEFAULT_IDEA_BLOCK_SIZE = 5
 
 CAMPAIGN_COLUMNS = (

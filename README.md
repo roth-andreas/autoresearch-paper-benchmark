@@ -91,7 +91,7 @@ Once PyTorch and PyG are working, initialize the shared ledgers:
 uv run python prepare.py init-results
 ```
 
-Bootstrap a new paper campaign from the neutral baseline:
+Bootstrap a new paper campaign from `main`:
 
 ```bash
 uv run python prepare.py bootstrap-campaign \
@@ -100,15 +100,15 @@ uv run python prepare.py bootstrap-campaign \
   --target-experiments 50
 ```
 
-By default, `bootstrap-campaign` starts from `neutral-baseline`. If you want to bootstrap from a different trusted ref, pass `--baseline-ref <git-ref>`.
+By default, `bootstrap-campaign` starts from `main`. If you want to bootstrap from a different trusted ref, pass `--baseline-ref <git-ref>`.
 
-If `neutral-baseline` does not exist yet, create it explicitly from a trusted branch or commit:
+If `main` is not available as a baseline ref in your local repository state, create the desired baseline explicitly from a trusted branch or commit:
 
 ```bash
 uv run python prepare.py bootstrap-campaign \
   --paper-label "MIMO Graph Conv" \
   --paper-url https://arxiv.org/abs/2505.11346 \
-  --create-baseline-from neutral-baseline \
+  --create-baseline-from main \
   --target-experiments 50
 ```
 

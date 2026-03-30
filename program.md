@@ -24,7 +24,7 @@ Each paper gets its own campaign.
 
 Recommended pattern:
 
-1. Keep one neutral baseline ref, for example `neutral-baseline`.
+1. Keep one shared baseline ref, for example `main`.
 2. Start every paper campaign from that same baseline ref.
 3. Use one git worktree per campaign so multiple agents can run in parallel.
 4. Register or bootstrap the campaign with [`prepare.py`](prepare.py).
@@ -56,7 +56,7 @@ python prepare.py bootstrap-campaign --paper-label "<paper title>" --paper-url <
 5. If the baseline ref does not exist yet, bootstrap with:
 
 ```bash
-python prepare.py bootstrap-campaign --paper-label "<paper title>" --paper-url <paper url> --create-baseline-from <neutral-baseline-ref>
+python prepare.py bootstrap-campaign --paper-label "<paper title>" --paper-url <paper url> --create-baseline-from <main-ref>
 ```
 
 6. Continue work inside the returned `worktree_path`.
