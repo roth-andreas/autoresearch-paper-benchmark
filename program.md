@@ -66,6 +66,14 @@ python prepare.py bootstrap-campaign --paper-label "<paper title>" --paper-url <
 python prepare.py show-campaign
 ```
 
+8. Verify the runtime again inside that worktree before starting experiments:
+
+```bash
+python -c "import torch, torch_geometric; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available()); print(torch_geometric.__version__)"
+```
+
+Do not assume the parent repository environment automatically carries over to a new worktree. If the worktree uses its own virtual environment, install or activate the required GPU-capable packages there before continuing.
+
 If the environment uses `uv`, run the same commands through `uv run`.
 
 ## Experiment Discipline
@@ -73,16 +81,16 @@ If the environment uses `uv`, run the same commands through `uv run`.
 Every logged row should represent one conceptual experiment, not every inner candidate sweep.
 The next experiment should usually be chosen only after inspecting the previous result.
 Do not turn the campaign into a fixed 50-run hyperparameter grid unless the user explicitly asks for that.
+Even when the user asks to finish all 50 experiments, still work adaptively in small batches, inspect the newest evidence, and then choose the next batch. A request to complete the full campaign is not permission to predeclare the whole schedule or blindly queue dozens of runs from one initial guess.
 
 Within one active campaign:
 
 1. Run the untouched baseline first.
 2. Make the paper-driven change in [`train.py`](train.py) that currently seems most promising.
-3. Run `python train.py`.
-4. Capture the reported validation result and artifact path.
-5. Log one row with `prepare.py log-result`.
-6. Use the paper plus the latest results to decide the next change.
-7. Repeat until the campaign reaches its target experiment count, usually 50.
+3. Run `python prepare.py run-and-log --short-caption "<caption>" --description "<text>"`.
+4. Read the returned validation result, status, log path, and artifact path.
+5. Use the paper plus the latest results to decide the next change.
+6. Repeat until the campaign reaches its target experiment count, usually 50.
 
 Stay paper-aligned:
 
@@ -97,6 +105,7 @@ Avoid defaulting to a predeclared experiment catalog:
 - do not hardcode dozens of future experiment ids or configs and then execute them blindly
 - do not let automation choose future experiments without first considering the newest validation evidence
 - helper scripts for setup or logging are fine, but they should not replace iterative research judgment
+- if a user explicitly asks for the whole campaign, prefer short adaptive batches with a brief checkpoint after each batch over one long unattended sweep
 - if you do run an inner sweep inside one experiment, keep it tightly scoped and describe the shared hypothesis in the logged row
 
 ## Logging
@@ -104,14 +113,17 @@ Avoid defaulting to a predeclared experiment catalog:
 Use the helper, never hand-edit TSV rows:
 
 ```bash
-python prepare.py log-result --commit <hash> --val-ap <ap> --params-k <k> --status <keep|discard|crash> --short-caption "<caption>" --description "<text>" --log-path <logfile> --artifact-path <artifact-dir>
+python prepare.py run-and-log --short-caption "<caption>" --description "<text>"
 ```
+
+That command runs `train.py`, captures stdout/stderr to a log file, evaluates the recoverable checkpoint, and writes the ledger row without requiring ad hoc shell parsing.
 
 Rules:
 
 - `short_caption` must be readable and at most 22 characters
+- `run-and-log` is the standard experiment entrypoint
+- if training fails or times out, `run-and-log` should still write a `crash` row with `val_ap 0` and `params_k 0`
 - `artifact_path` is required for every non-crash row
-- crashes should still be logged with `val_ap 0` and `params_k 0`
 - the active campaign is taken from `results/current_campaign.json` unless `--campaign-id` is supplied
 
 `results.tsv` columns:
@@ -155,12 +167,15 @@ campaign_id	paper_label	paper_url	baseline_ref	start_branch	target_experiments	c
 - checkpointing the best validation model during training
 - optional inner candidate sweeps inside one experiment
 
-When run normally, [`train.py`](train.py) should print:
+Users should normally run experiments through `prepare.py run-and-log`.
+When run directly, [`train.py`](train.py) should print:
 
 - selected candidate
 - parameter count
 - artifact path
+- log path
 - final validation AP
+- a machine-readable JSON summary line at the end for tooling
 
 ## Analysis
 

@@ -20,6 +20,8 @@ AGENTS.md
 dev/
 artifacts/
 progress.png
+data/
+run-*.log
 
 # Results and local campaign state
 results.tsv

@@ -76,6 +76,13 @@ RESULTS_COLUMNS = (
 RESULT_STATUSES = {'keep', 'discard', 'crash'}
 
 
+class ExperimentRunError(RuntimeError):
+    def __init__(self, message, artifact_dir='', log_path=''):
+        super().__init__(message)
+        self.artifact_dir = artifact_dir
+        self.log_path = log_path
+
+
 # ---------------------------------------------------------------------------
 # Benchmark utilities
 # ---------------------------------------------------------------------------
@@ -870,7 +877,12 @@ def _terminate_process(process):
         process.wait(timeout=5)
 
 
-def evaluate_validation_only(build_worker_command_fn, load_checkpoint_fn, campaign_id=''):
+def run_validation_experiment(
+    build_worker_command_fn,
+    load_checkpoint_fn,
+    campaign_id='',
+    log_path='',
+):
     campaign_id = _normalize_text(campaign_id) or get_active_campaign_id()
     if not campaign_id:
         raise ValueError('No active campaign selected for validation-only evaluation.')
@@ -880,20 +892,57 @@ def evaluate_validation_only(build_worker_command_fn, load_checkpoint_fn, campai
 
     checkpoint_path = os.path.join(artifact_dir, BEST_CHECKPOINT_NAME)
     command = build_worker_command_fn(artifact_dir, TIME_BUDGET)
-    process = subprocess.Popen(command, cwd=os.getcwd())
+    resolved_log_path = _normalize_text(log_path)
+    if not resolved_log_path:
+        resolved_log_path = os.path.join(artifact_dir, 'worker.log')
+
+    process = None
     timed_out = False
+    log_handle = None
 
     try:
-        process.wait(timeout=TIME_BUDGET)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _terminate_process(process)
+        if resolved_log_path:
+            _ensure_parent_dir(resolved_log_path)
+            log_handle = open(resolved_log_path, 'w', encoding='utf-8')
+            process = subprocess.Popen(
+                command,
+                cwd=os.getcwd(),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        else:
+            process = subprocess.Popen(command, cwd=os.getcwd())
 
-    if (not timed_out) and process.returncode != 0:
-        raise RuntimeError(f'Training worker failed with exit code {process.returncode}.')
+        try:
+            process.wait(timeout=TIME_BUDGET)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process(process)
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+
+    if timed_out:
+        raise ExperimentRunError(
+            'Training worker timed out before producing a recoverable checkpoint.',
+            artifact_dir=artifact_dir,
+            log_path=resolved_log_path,
+        )
+
+    if process.returncode != 0:
+        raise ExperimentRunError(
+            f'Training worker failed with exit code {process.returncode}.',
+            artifact_dir=artifact_dir,
+            log_path=resolved_log_path,
+        )
 
     if not os.path.exists(checkpoint_path):
-        raise RuntimeError('Training ended without writing a recoverable best checkpoint.')
+        raise ExperimentRunError(
+            'Training ended without writing a recoverable best checkpoint.',
+            artifact_dir=artifact_dir,
+            log_path=resolved_log_path,
+        )
 
     model, metadata = load_checkpoint_fn(checkpoint_path)
     val_loader = get_val_loader(metadata['batch_size'])
@@ -909,22 +958,30 @@ def evaluate_validation_only(build_worker_command_fn, load_checkpoint_fn, campai
             'val_ap': float(val_ap),
             'artifact_path': artifact_dir,
             'checkpoint_path': checkpoint_path,
+            'log_path': resolved_log_path,
             'timestamp': _utc_now_iso(),
         },
     )
 
-    return val_ap, metadata['params_k'], metadata['candidate'], artifact_dir
+    return {
+        'campaign_id': campaign_id,
+        'val_ap': float(val_ap),
+        'params_k': float(metadata['params_k']),
+        'candidate': dict(metadata.get('candidate', {})),
+        'batch_size': int(metadata['batch_size']),
+        'artifact_path': artifact_dir,
+        'checkpoint_path': checkpoint_path,
+        'log_path': resolved_log_path,
+    }
 
 
-def _load_train_snapshot_module(artifact_path):
-    train_path = os.path.join(artifact_path, TRAIN_SNAPSHOT_NAME)
+def _load_train_module_from_path(train_path, module_name):
     if not os.path.exists(train_path):
-        raise FileNotFoundError(f'Missing train snapshot: {train_path}')
+        raise FileNotFoundError(f'Missing train source: {train_path}')
 
     previous_prepare = sys.modules.get('prepare')
     sys.modules['prepare'] = sys.modules[__name__]
     try:
-        module_name = f'train_snapshot_{os.path.basename(artifact_path)}'
         spec = importlib.util.spec_from_file_location(module_name, train_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -935,6 +992,105 @@ def _load_train_snapshot_module(artifact_path):
             sys.modules.pop('prepare', None)
 
     return module
+
+
+def run_and_log_experiment(
+    short_caption,
+    description,
+    status='auto',
+    commit='',
+    campaign_id='',
+    branch='',
+    log_path='',
+    experiment_num=None,
+):
+    campaign_id = _normalize_text(campaign_id) or get_active_campaign_id()
+    if not campaign_id:
+        raise ValueError('No active campaign selected. Use use-campaign first.')
+
+    resolved_commit = _normalize_text(commit)
+    if not resolved_commit:
+        resolved_commit = _run_git_command('rev-parse', '--short', 'HEAD')
+
+    try:
+        train_module = _load_train_module_from_path(
+            os.path.join(os.getcwd(), 'train.py'),
+            'train_current_run_and_log',
+        )
+        run_summary = run_validation_experiment(
+            train_module.build_worker_command,
+            train_module.load_checkpoint_model,
+            campaign_id=campaign_id,
+            log_path=log_path,
+        )
+    except Exception as error:
+        crash_log_path = error.log_path if isinstance(error, ExperimentRunError) else ''
+        experiment_num = append_result_row(
+            commit=resolved_commit,
+            val_ap=0.0,
+            params_k=0.0,
+            status='crash',
+            short_caption=short_caption,
+            description=description,
+            campaign_id=campaign_id,
+            branch=branch,
+            log_path=crash_log_path,
+            artifact_path='',
+            experiment_num=experiment_num,
+        )
+        return {
+            'campaign_id': campaign_id,
+            'commit': resolved_commit,
+            'status': 'crash',
+            'experiment_num': int(experiment_num),
+            'short_caption': _normalize_short_caption(short_caption),
+            'description': _normalize_text(description),
+            'val_ap': 0.0,
+            'params_k': 0.0,
+            'artifact_path': '',
+            'log_path': crash_log_path,
+            'error': str(error),
+        }
+
+    normalized_status = _normalize_text(status).lower() or 'auto'
+    if normalized_status == 'auto':
+        prior_best = float('-inf')
+        for row in _load_result_rows(get_shared_results_path()):
+            if _normalize_text(row.get('campaign_id', '')) != campaign_id:
+                continue
+            prior_best = max(prior_best, _safe_float(row.get('val_ap', ''), default=float('-inf')))
+        normalized_status = 'keep' if run_summary['val_ap'] >= prior_best else 'discard'
+
+    experiment_num = append_result_row(
+        commit=resolved_commit,
+        val_ap=run_summary['val_ap'],
+        params_k=run_summary['params_k'],
+        status=normalized_status,
+        short_caption=short_caption,
+        description=description,
+        campaign_id=campaign_id,
+        branch=branch,
+        log_path=run_summary['log_path'],
+        artifact_path=run_summary['artifact_path'],
+        experiment_num=experiment_num,
+    )
+
+    run_summary.update(
+        {
+            'commit': resolved_commit,
+            'status': normalized_status,
+            'experiment_num': int(experiment_num),
+            'short_caption': _normalize_short_caption(short_caption),
+            'description': _normalize_text(description),
+        }
+    )
+    return run_summary
+
+
+def _load_train_snapshot_module(artifact_path):
+    train_path = os.path.join(artifact_path, TRAIN_SNAPSHOT_NAME)
+    module_name = f'train_snapshot_{os.path.basename(artifact_path)}'
+    return _load_train_module_from_path(train_path, module_name)
 
 
 def finalize_campaign_test(campaign_id='', experiment_num=None, force=False):
@@ -1101,22 +1257,23 @@ def _parse_cli_args():
     finalize_parser.add_argument('--force', action='store_true')
 
     log_parser = subparsers.add_parser(
-        'log-result',
-        help='Append one experiment row using validation AP only.',
+        'run-and-log',
+        help='Run train.py, capture a log, and append the experiment result.',
     )
     log_parser.add_argument('--campaign-id', default='')
-    log_parser.add_argument('--commit', required=True)
-    log_parser.add_argument('--val-ap', type=float, required=True)
-    log_parser.add_argument('--params-k', type=float, required=True)
-    log_parser.add_argument('--status', required=True, choices=sorted(RESULT_STATUSES))
+    log_parser.add_argument('--commit', default='')
+    log_parser.add_argument(
+        '--status',
+        default='auto',
+        choices=['auto', 'keep', 'discard'],
+    )
     log_parser.add_argument('--short-caption', required=True)
     log_parser.add_argument('--description', required=True)
     log_parser.add_argument('--branch', default='')
-    log_parser.add_argument('--log-path', default='')
     log_parser.add_argument(
-        '--artifact-path',
+        '--log-path',
         default='',
-        help='Required for non-crash rows so finalize-campaign-test can reload the model.',
+        help='Optional explicit log file path. Defaults to <artifact_dir>/worker.log.',
     )
     log_parser.add_argument('--experiment-num', type=int)
 
@@ -1184,18 +1341,15 @@ if __name__ == '__main__':
             force=cli_args.force,
         )
         print(json.dumps(summary, indent=2))
-    elif cli_args.command == 'log-result':
-        experiment_num = append_result_row(
-            commit=cli_args.commit,
-            val_ap=cli_args.val_ap,
-            params_k=cli_args.params_k,
-            status=cli_args.status,
+    elif cli_args.command == 'run-and-log':
+        summary = run_and_log_experiment(
             short_caption=cli_args.short_caption,
             description=cli_args.description,
+            status=cli_args.status,
+            commit=cli_args.commit,
             campaign_id=cli_args.campaign_id,
             branch=cli_args.branch,
             log_path=cli_args.log_path,
-            artifact_path=cli_args.artifact_path,
             experiment_num=cli_args.experiment_num,
         )
-        print(f'Logged experiment {experiment_num}.')
+        print(json.dumps(summary, indent=2))

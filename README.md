@@ -24,10 +24,12 @@ During a campaign, every experiment saves a recoverable checkpoint artifact and 
 
 Generated local files are ignored by git:
 
+- `data/`
 - `results.tsv`
 - `campaigns.tsv`
 - `results/current_campaign.json`
 - `progress.png`
+- `run-*.log`
 
 ## Quick Start
 
@@ -72,7 +74,7 @@ Instead, create or activate any environment that satisfies all of the following:
 - `torch_geometric` installed into that same environment
 - repository dependencies from [`pyproject.toml`](pyproject.toml) installed into that same environment
 
-The environment manager does not matter. `uv`, `conda`, `venv`, and similar tools are all acceptable as long as `python train.py` and `python prepare.py ...` run in the same GPU-capable environment.
+The environment manager does not matter. `uv`, `conda`, `venv`, and similar tools are all acceptable as long as this repository's Python commands run in the same GPU-capable environment.
 
 Before starting a campaign, verify the exact environment you plan to use:
 
@@ -118,6 +120,7 @@ The command prints a summary including:
 - `worktree_path`
 
 Open that worktree and continue there.
+Verify the runtime again inside that worktree before running experiments, because a fresh worktree may create or use a different local environment than the parent repository.
 
 ## Using An AI Agent
 
@@ -132,7 +135,7 @@ The models should follow the ideas of this paper: https://arxiv.org/abs/2505.113
 
 If your agent supports permission modes, restricted mode is a good default while you are getting comfortable with the workflow.
 
-The intended research style is adaptive, not a fixed preplanned sweep. After each experiment, the agent should inspect the result, update its view of what seems promising, and then decide the next change in [`train.py`](train.py). The default should not be to hardcode dozens of future experiment configs or auto-run the full campaign as one large hyperparameter grid.
+The intended research style is adaptive, not a fixed preplanned sweep. After each experiment, the agent should inspect the result, update its view of what seems promising, and then decide the next change in [`train.py`](train.py). The default should not be to hardcode dozens of future experiment configs or auto-run the full campaign as one large hyperparameter grid. Even if you ask an agent to finish all 50 experiments, the preferred behavior is still short adaptive batches with periodic reassessment, not one long unattended sweep.
 
 The expected flow is:
 
@@ -191,11 +194,10 @@ Inside a campaign worktree:
 
 1. Run the untouched baseline first.
 2. Implement the current best paper-driven change in [`train.py`](train.py).
-3. Run `uv run python train.py`.
-4. Read the reported `Selected candidate`, `Params k`, `Artifact path`, and `Final val`.
-5. Log one experiment row with `prepare.py log-result`.
-6. Decide the next change only after reading the current result, then repeat until the campaign reaches its target count.
-7. Finalize the holdout test once.
+3. Run `uv run python prepare.py run-and-log --short-caption "<caption>" --description "<text>"`.
+4. Read the returned validation result, status, log path, and artifact path.
+5. Decide the next change only after reading the current result, then repeat until the campaign reaches its target count.
+6. Finalize the holdout test once.
 
 The campaign should mostly look like iterative research, not a blind search:
 
@@ -204,25 +206,20 @@ The campaign should mostly look like iterative research, not a blind search:
 - small paper-motivated sweeps are allowed, but they should support one local hypothesis rather than replace the overall adaptive loop
 - do not precommit to a full 50-experiment schedule up front unless the user explicitly asks for that style
 
-Example logging command:
+Example experiment command:
 
 ```bash
-uv run python prepare.py log-result \
-  --commit b09960f \
-  --val-ap 0.424 \
-  --params-k 49.9 \
-  --status keep \
+uv run python prepare.py run-and-log \
   --short-caption "LMGC p35 b180" \
-  --description "LMGC tanh mixer with patience 35 and batch size 180" \
-  --log-path run-exp44.log \
-  --artifact-path /path/to/artifact
+  --description "LMGC tanh mixer with patience 35 and batch size 180"
 ```
 
 Rules:
 
 - `val_ap` is the only per-experiment score stored in `results.tsv`
+- `prepare.py run-and-log` is the standard way to execute and record an experiment
 - `artifact_path` is required for every non-crash row
-- crashes should still be logged with status `crash`, `val_ap 0`, and `params_k 0`
+- crashes should still be logged with status `crash`, `val_ap 0`, and `params_k 0`; `run-and-log` handles that automatically
 - the test set must not be used during the campaign to choose which experiment to keep
 
 ## Final Test Once

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import sys
@@ -16,10 +17,10 @@ from prepare import (
     BEST_CHECKPOINT_NAME,
     MAX_PARAMS,
     evaluate_loader,
-    evaluate_validation_only,
     get_feature_dims,
     get_num_tasks,
     get_train_val_loaders,
+    run_validation_experiment,
 )
 
 
@@ -374,11 +375,20 @@ if __name__ == '__main__':
             raise RuntimeError('--budget is required in worker mode.')
         run_training_session(cli_args.worker_dir, cli_args.budget)
     else:
-        val_ap, params_k, selected, artifact_path = evaluate_validation_only(
+        run_summary = run_validation_experiment(
             build_worker_command,
             load_checkpoint_model,
         )
-        print(f"Selected candidate: {selected.get('name', 'unnamed')}")
-        print(f'Params k: {params_k:.1f}')
-        print(f'Artifact path: {artifact_path}')
-        print(f'Final val: {val_ap:.3f}')
+        summary = {
+            'selected_candidate': run_summary['candidate'],
+            'params_k': float(run_summary['params_k']),
+            'artifact_path': run_summary['artifact_path'],
+            'log_path': run_summary['log_path'],
+            'final_val_ap': float(run_summary['val_ap']),
+        }
+        print(f"Selected candidate: {run_summary['candidate'].get('name', 'unnamed')}")
+        print(f"Params k: {run_summary['params_k']:.1f}")
+        print(f"Artifact path: {run_summary['artifact_path']}")
+        print(f"Log path: {run_summary['log_path']}")
+        print(f"Final val: {run_summary['val_ap']:.3f}")
+        print(json.dumps(summary, sort_keys=True))
