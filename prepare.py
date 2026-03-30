@@ -40,6 +40,7 @@ TRAIN_SNAPSHOT_NAME = 'train_snapshot.py'
 CHECKPOINT_SUMMARY_NAME = 'checkpoint_summary.json'
 FINAL_TEST_SUMMARY_NAME = 'final_test_summary.json'
 DEFAULT_BASELINE_REF = 'neutral-baseline'
+DEFAULT_IDEA_BLOCK_SIZE = 5
 
 CAMPAIGN_COLUMNS = (
     'campaign_id',
@@ -48,6 +49,7 @@ CAMPAIGN_COLUMNS = (
     'baseline_ref',
     'start_branch',
     'target_experiments',
+    'idea_block_size',
     'created_at',
     'notes',
     'final_test_experiment_num',
@@ -67,6 +69,12 @@ RESULTS_COLUMNS = (
     'status',
     'short_caption',
     'description',
+    'block_id',
+    'block_label',
+    'block_run_index',
+    'block_size',
+    'block_role',
+    'seed_experiment_num',
     'branch',
     'log_path',
     'artifact_path',
@@ -74,6 +82,7 @@ RESULTS_COLUMNS = (
 )
 
 RESULT_STATUSES = {'keep', 'discard', 'crash'}
+BLOCK_ROLES = {'seed', 'tune'}
 
 
 class ExperimentRunError(RuntimeError):
@@ -244,6 +253,13 @@ def _normalize_positive_int(value, field_name):
     return normalized_value
 
 
+def _normalize_optional_positive_int(value, field_name):
+    text = _normalize_text(value)
+    if not text:
+        return None
+    return _normalize_positive_int(text, field_name)
+
+
 def _normalize_short_caption(short_caption, max_len=22):
     value = _normalize_text(short_caption)
     if not value:
@@ -263,6 +279,25 @@ def _safe_float(value, default=float('nan')):
         return float(text)
     except ValueError:
         return default
+
+
+def _safe_int(value, default=0):
+    text = _normalize_text(value)
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        return default
+
+
+def _normalize_block_role(block_role):
+    value = _normalize_text(block_role).lower()
+    if not value:
+        return ''
+    if value not in BLOCK_ROLES:
+        raise ValueError(f'Invalid block_role {block_role!r}. Expected one of {sorted(BLOCK_ROLES)}.')
+    return value
 
 
 def _utc_now_iso():
@@ -389,10 +424,8 @@ def initialize_shared_ledgers():
     results_path = get_shared_results_path()
     campaigns_path = get_shared_campaigns_path()
     os.makedirs(get_shared_artifacts_dir(), exist_ok=True)
-    if not os.path.exists(results_path) or os.path.getsize(results_path) == 0:
-        initialize_results_tsv(results_path)
-    if not os.path.exists(campaigns_path) or os.path.getsize(campaigns_path) == 0:
-        initialize_campaigns_tsv(campaigns_path)
+    _ensure_tsv_schema(results_path, RESULTS_COLUMNS)
+    _ensure_tsv_schema(campaigns_path, CAMPAIGN_COLUMNS)
     return results_path, campaigns_path
 
 
@@ -426,6 +459,16 @@ def _rewrite_tsv(path, columns, rows):
         writer.writeheader()
         for row in rows:
             writer.writerow({column: row.get(column, '') for column in columns})
+
+
+def _ensure_tsv_schema(path, columns):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        _initialize_tsv(path, columns)
+        return
+
+    fieldnames, rows = _load_tsv_rows(path)
+    if tuple(fieldnames) != tuple(columns):
+        _rewrite_tsv(path, columns, rows)
 
 
 def _write_active_campaign_id(campaign_id, path=ACTIVE_CAMPAIGN_PATH):
@@ -531,6 +574,7 @@ def register_campaign(
     baseline_ref='',
     start_branch='',
     target_experiments=50,
+    idea_block_size=DEFAULT_IDEA_BLOCK_SIZE,
     notes='',
     local_root=None,
 ):
@@ -540,6 +584,7 @@ def register_campaign(
     baseline_ref = _normalize_text(baseline_ref)
     start_branch = _normalize_text(start_branch) or _safe_current_branch()
     target_experiments = _normalize_positive_int(target_experiments, 'target_experiments')
+    idea_block_size = _normalize_positive_int(idea_block_size, 'idea_block_size')
     notes = _normalize_text(notes)
 
     with _shared_lock():
@@ -553,9 +598,13 @@ def register_campaign(
                 'baseline_ref': baseline_ref,
                 'start_branch': start_branch,
                 'target_experiments': str(target_experiments),
+                'idea_block_size': str(idea_block_size),
             }
             for field_name, expected_value in expected.items():
-                if _normalize_text(existing.get(field_name, '')) != _normalize_text(expected_value):
+                existing_value = _normalize_text(existing.get(field_name, ''))
+                if field_name == 'idea_block_size' and not existing_value:
+                    existing_value = str(DEFAULT_IDEA_BLOCK_SIZE)
+                if existing_value != _normalize_text(expected_value):
                     mismatch_fields.append(field_name)
             if mismatch_fields:
                 raise ValueError(
@@ -572,6 +621,7 @@ def register_campaign(
                     baseline_ref,
                     start_branch,
                     str(target_experiments),
+                    str(idea_block_size),
                     _utc_now_iso(),
                     notes,
                     '',
@@ -603,12 +653,227 @@ def show_active_campaign(path=None):
     return _campaign_row_by_id(campaign_id)
 
 
-def _guess_baseline_ref():
-    for campaign in reversed(list_campaigns()):
-        baseline_ref = _normalize_text(campaign.get('baseline_ref', ''))
-        if baseline_ref:
-            return baseline_ref
-    return DEFAULT_BASELINE_REF
+def _campaign_idea_block_size(campaign):
+    if campaign is None:
+        return DEFAULT_IDEA_BLOCK_SIZE
+    return _safe_int(campaign.get('idea_block_size', ''), default=DEFAULT_IDEA_BLOCK_SIZE)
+
+
+def _block_rows_for_campaign(campaign_id, block_id, path=None):
+    results_path = path or get_shared_results_path()
+    rows = [
+        row for row in _load_result_rows(results_path)
+        if (
+            _normalize_text(row.get('campaign_id', '')) == campaign_id
+            and _normalize_text(row.get('block_id', '')) == block_id
+        )
+    ]
+    return sorted(rows, key=lambda row: _safe_int(row.get('experiment_num', ''), default=0))
+
+
+def _resolve_block_metadata(
+    campaign,
+    experiment_num,
+    results_path,
+    block_id='',
+    block_label='',
+    block_run_index=None,
+    block_size=None,
+    block_role='',
+    seed_experiment_num=None,
+):
+    normalized_block_label = _normalize_text(block_label)
+    normalized_block_id = _normalize_text(block_id) or (
+        _slugify(normalized_block_label) if normalized_block_label else ''
+    )
+    normalized_block_role = _normalize_block_role(block_role)
+    normalized_block_run_index = _normalize_optional_positive_int(
+        block_run_index, 'block_run_index'
+    )
+    normalized_block_size = _normalize_optional_positive_int(block_size, 'block_size')
+    normalized_seed_experiment_num = _normalize_optional_positive_int(
+        seed_experiment_num, 'seed_experiment_num'
+    )
+
+    any_block_metadata = any(
+        [
+            normalized_block_id,
+            normalized_block_label,
+            normalized_block_run_index is not None,
+            normalized_block_size is not None,
+            normalized_block_role,
+            normalized_seed_experiment_num is not None,
+        ]
+    )
+    if not any_block_metadata:
+        return {
+            'block_id': '',
+            'block_label': '',
+            'block_run_index': '',
+            'block_size': '',
+            'block_role': '',
+            'seed_experiment_num': '',
+        }
+
+    if not normalized_block_id:
+        raise ValueError(
+            'Block logging requires --block-id or --block-label so the experiment '
+            'can be assigned to an idea block.'
+        )
+
+    existing_rows = _block_rows_for_campaign(
+        campaign_id=campaign['campaign_id'],
+        block_id=normalized_block_id,
+        path=results_path,
+    )
+    campaign_block_size = _campaign_idea_block_size(campaign)
+
+    if existing_rows:
+        existing_label = _normalize_text(existing_rows[0].get('block_label', ''))
+        existing_block_size = _safe_int(
+            existing_rows[0].get('block_size', ''),
+            default=campaign_block_size,
+        )
+        existing_seed_experiment_num = _safe_int(
+            existing_rows[0].get('seed_experiment_num', ''),
+            default=_safe_int(existing_rows[0].get('experiment_num', ''), default=0),
+        )
+        next_block_run_index = max(
+            _safe_int(row.get('block_run_index', ''), default=0) for row in existing_rows
+        ) + 1
+
+        if normalized_block_label and existing_label and normalized_block_label != existing_label:
+            raise ValueError(
+                f'block_label {normalized_block_label!r} does not match the existing '
+                f'label {existing_label!r} for block_id {normalized_block_id!r}.'
+            )
+        normalized_block_label = normalized_block_label or existing_label
+
+        if normalized_block_size is None:
+            normalized_block_size = existing_block_size
+        elif normalized_block_size != existing_block_size:
+            raise ValueError(
+                f'block_size {normalized_block_size} does not match the existing '
+                f'block size {existing_block_size} for block_id {normalized_block_id!r}.'
+            )
+
+        if normalized_block_run_index is None:
+            normalized_block_run_index = next_block_run_index
+        elif normalized_block_run_index != next_block_run_index:
+            raise ValueError(
+                f'Next run in block {normalized_block_id!r} must use block_run_index '
+                f'{next_block_run_index}, got {normalized_block_run_index}.'
+            )
+
+        if normalized_seed_experiment_num is None:
+            normalized_seed_experiment_num = existing_seed_experiment_num
+        elif normalized_seed_experiment_num != existing_seed_experiment_num:
+            raise ValueError(
+                f'seed_experiment_num {normalized_seed_experiment_num} does not match '
+                f'the existing seed experiment {existing_seed_experiment_num} for block '
+                f'{normalized_block_id!r}.'
+            )
+    else:
+        if not normalized_block_label:
+            raise ValueError(
+                'The first run in an idea block requires --block-label so the larger '
+                'paper idea is recorded in the ledger.'
+            )
+        if normalized_block_size is None:
+            normalized_block_size = campaign_block_size
+        if normalized_block_run_index is None:
+            normalized_block_run_index = 1
+        if normalized_block_run_index != 1:
+            raise ValueError(
+                f'The first run in block {normalized_block_id!r} must use block_run_index 1.'
+            )
+        if normalized_seed_experiment_num is None:
+            normalized_seed_experiment_num = int(experiment_num)
+        elif normalized_seed_experiment_num != int(experiment_num):
+            raise ValueError(
+                'The first run in a block must use its own experiment number as '
+                'seed_experiment_num.'
+            )
+
+    if normalized_block_run_index > normalized_block_size:
+        raise ValueError(
+            f'Block {normalized_block_id!r} has size {normalized_block_size}, so it '
+            f'cannot accept block_run_index {normalized_block_run_index}.'
+        )
+
+    if not normalized_block_role:
+        normalized_block_role = 'seed' if normalized_block_run_index == 1 else 'tune'
+
+    if normalized_block_run_index == 1 and normalized_block_role != 'seed':
+        raise ValueError('The first run in an idea block must use block_role "seed".')
+    if normalized_block_run_index > 1 and normalized_block_role != 'tune':
+        raise ValueError('Follow-up runs in an idea block must use block_role "tune".')
+
+    return {
+        'block_id': normalized_block_id,
+        'block_label': normalized_block_label,
+        'block_run_index': str(normalized_block_run_index),
+        'block_size': str(normalized_block_size),
+        'block_role': normalized_block_role,
+        'seed_experiment_num': str(normalized_seed_experiment_num),
+    }
+
+
+def list_campaign_blocks(campaign_id=''):
+    campaign_id = _normalize_text(campaign_id) or get_active_campaign_id()
+    if not campaign_id:
+        raise ValueError('No active campaign selected. Use use-campaign first.')
+
+    initialize_shared_ledgers()
+    rows = [
+        row for row in _load_result_rows(get_shared_results_path())
+        if (
+            _normalize_text(row.get('campaign_id', '')) == campaign_id
+            and _normalize_text(row.get('block_id', ''))
+        )
+    ]
+
+    grouped = {}
+    for row in rows:
+        block_id = _normalize_text(row.get('block_id', ''))
+        grouped.setdefault(block_id, []).append(row)
+
+    summaries = []
+    for block_id, block_rows in grouped.items():
+        block_rows.sort(key=lambda row: _safe_int(row.get('experiment_num', ''), default=0))
+        best_row = max(
+            block_rows,
+            key=lambda row: _safe_float(row.get('val_ap', ''), default=float('-inf')),
+        )
+        block_size = _safe_int(
+            block_rows[0].get('block_size', ''),
+            default=DEFAULT_IDEA_BLOCK_SIZE,
+        )
+        summaries.append(
+            {
+                'block_id': block_id,
+                'block_label': _normalize_text(block_rows[0].get('block_label', '')),
+                'runs_logged': len(block_rows),
+                'block_size': block_size,
+                'completed': len(block_rows) >= block_size,
+                'seed_experiment_num': _safe_int(
+                    block_rows[0].get('seed_experiment_num', ''),
+                    default=_safe_int(block_rows[0].get('experiment_num', ''), default=0),
+                ),
+                'best_experiment_num': _safe_int(best_row.get('experiment_num', ''), default=0),
+                'best_val_ap': _safe_float(best_row.get('val_ap', ''), default=float('nan')),
+                'first_experiment_num': _safe_int(
+                    block_rows[0].get('experiment_num', ''),
+                    default=0,
+                ),
+                'last_experiment_num': _safe_int(
+                    block_rows[-1].get('experiment_num', ''),
+                    default=0,
+                ),
+            }
+        )
+
+    return sorted(summaries, key=lambda row: row['first_experiment_num'])
 
 
 def _bootstrap_summary(
@@ -617,6 +882,7 @@ def _bootstrap_summary(
     paper_url,
     baseline_ref,
     start_branch,
+    idea_block_size,
     worktree_path,
     baseline_exists,
     baseline_created,
@@ -629,6 +895,7 @@ def _bootstrap_summary(
         'paper_url': paper_url,
         'baseline_ref': baseline_ref,
         'start_branch': start_branch,
+        'idea_block_size': int(idea_block_size),
         'worktree_path': os.path.abspath(worktree_path),
         'baseline_exists': baseline_exists,
         'baseline_created': baseline_created,
@@ -645,6 +912,7 @@ def bootstrap_campaign(
     branch='',
     worktree_path='',
     target_experiments=50,
+    idea_block_size=DEFAULT_IDEA_BLOCK_SIZE,
     notes='',
     create_baseline_from='',
     dry_run=False,
@@ -657,10 +925,11 @@ def bootstrap_campaign(
         paper_url=paper_url,
         paper_label=paper_label,
     )
-    baseline_ref = _normalize_text(baseline_ref) or _guess_baseline_ref()
+    baseline_ref = _normalize_text(baseline_ref) or DEFAULT_BASELINE_REF
     branch = _normalize_text(branch) or f'paper/{campaign_id}'
     worktree_path = _normalize_text(worktree_path) or _default_worktree_path(campaign_id)
     target_experiments = _normalize_positive_int(target_experiments, 'target_experiments')
+    idea_block_size = _normalize_positive_int(idea_block_size, 'idea_block_size')
     notes = _normalize_text(notes)
     create_baseline_from = _normalize_text(create_baseline_from)
 
@@ -678,6 +947,7 @@ def bootstrap_campaign(
                 paper_url=paper_url,
                 baseline_ref=baseline_ref,
                 start_branch=branch,
+                idea_block_size=idea_block_size,
                 worktree_path=worktree_path,
                 baseline_exists=False,
                 baseline_created=False,
@@ -702,6 +972,7 @@ def bootstrap_campaign(
             paper_url=paper_url,
             baseline_ref=baseline_ref,
             start_branch=branch,
+            idea_block_size=idea_block_size,
             worktree_path=worktree_path,
             baseline_exists=baseline_exists,
             baseline_created=not baseline_exists,
@@ -726,6 +997,7 @@ def bootstrap_campaign(
         baseline_ref=baseline_ref,
         start_branch=branch,
         target_experiments=target_experiments,
+        idea_block_size=idea_block_size,
         notes=notes,
         local_root=worktree_path,
     )
@@ -737,6 +1009,7 @@ def bootstrap_campaign(
         paper_url=paper_url,
         baseline_ref=baseline_ref,
         start_branch=branch,
+        idea_block_size=idea_block_size,
         worktree_path=worktree_path,
         baseline_exists=True,
         baseline_created=baseline_created,
@@ -779,6 +1052,16 @@ def _next_experiment_num(campaign_id, path=None):
     return max_experiment_num + 1
 
 
+def _result_row_by_experiment_num(campaign_id, experiment_num, path=None):
+    results_path = path or get_shared_results_path()
+    for row in _load_result_rows(results_path):
+        if _normalize_text(row.get('campaign_id', '')) != campaign_id:
+            continue
+        if _safe_int(row.get('experiment_num', ''), default=0) == int(experiment_num):
+            return row
+    return None
+
+
 def _append_result_dict(row, path):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         initialize_results_tsv(path)
@@ -799,6 +1082,12 @@ def append_result_row(
     status,
     short_caption,
     description,
+    block_id='',
+    block_label='',
+    block_run_index=None,
+    block_size=None,
+    block_role='',
+    seed_experiment_num=None,
     campaign_id='',
     branch='',
     log_path='',
@@ -847,6 +1136,18 @@ def append_result_row(
                     f'{campaign["campaign_id"]!r}.'
                 )
 
+        block_metadata = _resolve_block_metadata(
+            campaign=campaign,
+            experiment_num=experiment_num,
+            results_path=results_path,
+            block_id=block_id,
+            block_label=block_label,
+            block_run_index=block_run_index,
+            block_size=block_size,
+            block_role=block_role,
+            seed_experiment_num=seed_experiment_num,
+        )
+
         row = {
             'campaign_id': campaign['campaign_id'],
             'paper_label': _normalize_text(campaign.get('paper_label', '')),
@@ -857,6 +1158,12 @@ def append_result_row(
             'status': normalized_status,
             'short_caption': short_caption,
             'description': description,
+            'block_id': block_metadata['block_id'],
+            'block_label': block_metadata['block_label'],
+            'block_run_index': block_metadata['block_run_index'],
+            'block_size': block_metadata['block_size'],
+            'block_role': block_metadata['block_role'],
+            'seed_experiment_num': block_metadata['seed_experiment_num'],
             'branch': branch,
             'log_path': log_path,
             'artifact_path': artifact_path,
@@ -998,6 +1305,12 @@ def run_and_log_experiment(
     short_caption,
     description,
     status='auto',
+    block_id='',
+    block_label='',
+    block_run_index=None,
+    block_size=None,
+    block_role='',
+    seed_experiment_num=None,
     commit='',
     campaign_id='',
     branch='',
@@ -1032,12 +1345,19 @@ def run_and_log_experiment(
             status='crash',
             short_caption=short_caption,
             description=description,
+            block_id=block_id,
+            block_label=block_label,
+            block_run_index=block_run_index,
+            block_size=block_size,
+            block_role=block_role,
+            seed_experiment_num=seed_experiment_num,
             campaign_id=campaign_id,
             branch=branch,
             log_path=crash_log_path,
             artifact_path='',
             experiment_num=experiment_num,
         )
+        result_row = _result_row_by_experiment_num(campaign_id, experiment_num)
         return {
             'campaign_id': campaign_id,
             'commit': resolved_commit,
@@ -1050,6 +1370,14 @@ def run_and_log_experiment(
             'artifact_path': '',
             'log_path': crash_log_path,
             'error': str(error),
+            'block_id': _normalize_text((result_row or {}).get('block_id', '')),
+            'block_label': _normalize_text((result_row or {}).get('block_label', '')),
+            'block_run_index': _normalize_text((result_row or {}).get('block_run_index', '')),
+            'block_size': _normalize_text((result_row or {}).get('block_size', '')),
+            'block_role': _normalize_text((result_row or {}).get('block_role', '')),
+            'seed_experiment_num': _normalize_text(
+                (result_row or {}).get('seed_experiment_num', '')
+            ),
         }
 
     normalized_status = _normalize_text(status).lower() or 'auto'
@@ -1068,12 +1396,19 @@ def run_and_log_experiment(
         status=normalized_status,
         short_caption=short_caption,
         description=description,
+        block_id=block_id,
+        block_label=block_label,
+        block_run_index=block_run_index,
+        block_size=block_size,
+        block_role=block_role,
+        seed_experiment_num=seed_experiment_num,
         campaign_id=campaign_id,
         branch=branch,
         log_path=run_summary['log_path'],
         artifact_path=run_summary['artifact_path'],
         experiment_num=experiment_num,
     )
+    result_row = _result_row_by_experiment_num(campaign_id, experiment_num)
 
     run_summary.update(
         {
@@ -1082,6 +1417,14 @@ def run_and_log_experiment(
             'experiment_num': int(experiment_num),
             'short_caption': _normalize_short_caption(short_caption),
             'description': _normalize_text(description),
+            'block_id': _normalize_text((result_row or {}).get('block_id', '')),
+            'block_label': _normalize_text((result_row or {}).get('block_label', '')),
+            'block_run_index': _normalize_text((result_row or {}).get('block_run_index', '')),
+            'block_size': _normalize_text((result_row or {}).get('block_size', '')),
+            'block_role': _normalize_text((result_row or {}).get('block_role', '')),
+            'seed_experiment_num': _normalize_text(
+                (result_row or {}).get('seed_experiment_num', '')
+            ),
         }
     )
     return run_summary
@@ -1218,6 +1561,7 @@ def _parse_cli_args():
     bootstrap_parser.add_argument('--branch', default='')
     bootstrap_parser.add_argument('--worktree-path', default='')
     bootstrap_parser.add_argument('--target-experiments', type=int, default=50)
+    bootstrap_parser.add_argument('--idea-block-size', type=int, default=DEFAULT_IDEA_BLOCK_SIZE)
     bootstrap_parser.add_argument('--notes', default='')
     bootstrap_parser.add_argument('--create-baseline-from', default='')
     bootstrap_parser.add_argument(
@@ -1236,6 +1580,7 @@ def _parse_cli_args():
     start_parser.add_argument('--baseline-ref', default='')
     start_parser.add_argument('--start-branch', default='')
     start_parser.add_argument('--target-experiments', type=int, default=50)
+    start_parser.add_argument('--idea-block-size', type=int, default=DEFAULT_IDEA_BLOCK_SIZE)
     start_parser.add_argument('--notes', default='')
 
     use_parser = subparsers.add_parser(
@@ -1246,6 +1591,11 @@ def _parse_cli_args():
 
     subparsers.add_parser('show-campaign', help='Show the active local campaign.')
     subparsers.add_parser('list-campaigns', help='List all registered campaigns.')
+    show_blocks_parser = subparsers.add_parser(
+        'show-blocks',
+        help='Summarize logged idea blocks for the active or selected campaign.',
+    )
+    show_blocks_parser.add_argument('--campaign-id', default='')
     subparsers.add_parser('show-paths', help='Print shared ledger and snapshot paths.')
 
     finalize_parser = subparsers.add_parser(
@@ -1269,6 +1619,17 @@ def _parse_cli_args():
     )
     log_parser.add_argument('--short-caption', required=True)
     log_parser.add_argument('--description', required=True)
+    log_parser.add_argument('--block-id', default='')
+    log_parser.add_argument('--block-label', default='')
+    log_parser.add_argument('--block-run-index', type=int)
+    log_parser.add_argument('--block-size', type=int)
+    log_parser.add_argument(
+        '--block-role',
+        default='',
+        choices=['', 'seed', 'tune'],
+        help='Optional role inside the idea block. Defaults to seed for run 1 and tune otherwise.',
+    )
+    log_parser.add_argument('--seed-experiment-num', type=int)
     log_parser.add_argument('--branch', default='')
     log_parser.add_argument(
         '--log-path',
@@ -1295,6 +1656,7 @@ if __name__ == '__main__':
             branch=cli_args.branch,
             worktree_path=cli_args.worktree_path,
             target_experiments=cli_args.target_experiments,
+            idea_block_size=cli_args.idea_block_size,
             notes=cli_args.notes,
             create_baseline_from=cli_args.create_baseline_from,
             dry_run=cli_args.dry_run,
@@ -1308,6 +1670,7 @@ if __name__ == '__main__':
             baseline_ref=cli_args.baseline_ref,
             start_branch=cli_args.start_branch,
             target_experiments=cli_args.target_experiments,
+            idea_block_size=cli_args.idea_block_size,
             notes=cli_args.notes,
         )
     elif cli_args.command == 'use-campaign':
@@ -1326,6 +1689,26 @@ if __name__ == '__main__':
             print('\\t'.join(CAMPAIGN_COLUMNS))
             for campaign in campaigns:
                 print('\\t'.join(str(campaign.get(column, '')) for column in CAMPAIGN_COLUMNS))
+    elif cli_args.command == 'show-blocks':
+        blocks = list_campaign_blocks(cli_args.campaign_id)
+        if not blocks:
+            print('No idea blocks logged.')
+        else:
+            columns = (
+                'block_id',
+                'block_label',
+                'runs_logged',
+                'block_size',
+                'completed',
+                'seed_experiment_num',
+                'best_experiment_num',
+                'best_val_ap',
+                'first_experiment_num',
+                'last_experiment_num',
+            )
+            print('\\t'.join(columns))
+            for block in blocks:
+                print('\\t'.join(str(block.get(column, '')) for column in columns))
     elif cli_args.command == 'show-paths':
         print(f'shared_state_dir\\t{get_shared_state_dir()}')
         print(f'shared_results_tsv\\t{get_shared_results_path()}')
@@ -1346,6 +1729,12 @@ if __name__ == '__main__':
             short_caption=cli_args.short_caption,
             description=cli_args.description,
             status=cli_args.status,
+            block_id=cli_args.block_id,
+            block_label=cli_args.block_label,
+            block_run_index=cli_args.block_run_index,
+            block_size=cli_args.block_size,
+            block_role=cli_args.block_role,
+            seed_experiment_num=cli_args.seed_experiment_num,
             commit=cli_args.commit,
             campaign_id=cli_args.campaign_id,
             branch=cli_args.branch,

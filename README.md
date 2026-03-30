@@ -129,21 +129,22 @@ Verify the runtime again inside that worktree before running experiments, becaus
 A good starter prompt is:
 
 ```text
-Hi have a look at program.md and let's kick off a new experiment! Let's do the setup first.
+Hi have a look at program.md and let's kick off a new experiment! Do the setup first, then run this campaign all the way through 50 experiments iteratively.
+Run the campaign in 5-experiment idea blocks: each block should test one larger paper idea and then spend the rest of the block on local tuning around that idea.
 The models should follow the ideas of this paper: https://arxiv.org/abs/2505.11346
 ```
 
 If your agent supports permission modes, restricted mode is a good default while you are getting comfortable with the workflow.
 
-The intended research style is adaptive, not a fixed preplanned sweep. After each experiment, the agent should inspect the result, update its view of what seems promising, and then decide the next change in [`train.py`](train.py). The default should not be to hardcode dozens of future experiment configs or auto-run the full campaign as one large hyperparameter grid. Even if you ask an agent to finish all 50 experiments, the preferred behavior is still short adaptive batches with periodic reassessment, not one long unattended sweep.
+The intended research style is adaptive, but the default unit of adaptation should be the idea block, not the single tiny tweak. For a 50-run campaign, the preferred pattern is one untouched baseline followed by paper-aligned blocks of about 5 runs each: one seed implementation of a larger paper idea plus up to four local tuning runs around that same mechanism. The default should not be to hardcode dozens of future experiment configs or auto-run the full campaign as one large hyperparameter grid.
 
 The expected flow is:
 
 1. The agent reads `README.md`, `prepare.py`, `train.py`, and `program.md`.
 2. The agent bootstraps or activates a paper campaign.
 3. The agent runs the baseline first.
-4. The agent iterates on `train.py` with paper-aligned changes chosen from the paper plus the results seen so far.
-5. The agent logs one validation result per experiment.
+4. The agent iterates on `train.py` in paper-aligned idea blocks, usually 5 runs per larger idea.
+5. The agent logs one validation result per experiment, including idea-block metadata.
 6. After the campaign reaches its target count, the agent runs the one-shot final test.
 
 ## Multiple Agents
@@ -162,12 +163,14 @@ Recommended pattern:
 Example prompts for two parallel papers:
 
 ```text
-Hi have a look at program.md and let's kick off a new experiment! Let's do the setup first.
+Hi have a look at program.md and let's kick off a new experiment! Do the setup first, then run this campaign all the way through 50 experiments iteratively.
+Run the campaign in 5-experiment idea blocks: each block should test one larger paper idea and then spend the rest of the block on local tuning around that idea.
 The models should follow the ideas of this paper: https://arxiv.org/abs/2505.11346
 ```
 
 ```text
-Hi have a look at program.md and let's kick off a new experiment! Let's do the setup first.
+Hi have a look at program.md and let's kick off a new experiment! Do the setup first, then run this campaign all the way through 50 experiments iteratively.
+Run the campaign in 5-experiment idea blocks: each block should test one larger paper idea and then spend the rest of the block on local tuning around that idea.
 The models should follow the ideas of this paper: https://arxiv.org/abs/2105.14491
 ```
 
@@ -193,31 +196,38 @@ You can override the shared state location with `AUTORESEARCH_SHARED_DIR`, but t
 Inside a campaign worktree:
 
 1. Run the untouched baseline first.
-2. Implement the current best paper-driven change in [`train.py`](train.py).
-3. Run `uv run python prepare.py run-and-log --short-caption "<caption>" --description "<text>"`.
-4. Read the returned validation result, status, log path, and artifact path.
-5. Decide the next change only after reading the current result, then repeat until the campaign reaches its target count.
+2. Choose one larger paper-driven idea and implement the seed version in [`train.py`](train.py).
+3. Log that seed with `run-and-log` using a new `block_id` and `block_label`.
+4. Run up to four nearby tuning experiments within the same block.
+5. Decide the next larger paper idea only after reading the current block outcome, then repeat until the campaign reaches its target count.
 6. Finalize the holdout test once.
 
 The campaign should mostly look like iterative research, not a blind search:
 
-- early experiments should be willing to make larger architectural or training-process changes when the paper suggests them
-- later experiments can narrow in with smaller follow-up changes once a strong direction appears
-- small paper-motivated sweeps are allowed, but they should support one local hypothesis rather than replace the overall adaptive loop
+- early blocks should be willing to make larger architectural or training-process changes when the paper suggests them
+- later blocks can narrow in with smaller follow-up changes once a strong direction appears
+- small paper-motivated sweeps are allowed within a block, but they should support one local hypothesis rather than replace the overall idea-level loop
 - do not precommit to a full 50-experiment schedule up front unless the user explicitly asks for that style
+- the default block size is `5`, controlled by the campaign's `idea_block_size`
 
 Example experiment command:
 
 ```bash
 uv run python prepare.py run-and-log \
-  --short-caption "LMGC p35 b180" \
-  --description "LMGC tanh mixer with patience 35 and batch size 180"
+  --block-id lmgc-readout \
+  --block-label "LMGC with richer readout" \
+  --block-run-index 1 \
+  --block-role seed \
+  --short-caption "LMGC readout" \
+  --description "Seed run for the LMGC richer-readout idea block"
 ```
 
 Rules:
 
 - `val_ap` is the only per-experiment score stored in `results.tsv`
 - `prepare.py run-and-log` is the standard way to execute and record an experiment
+- `block_id` groups the larger paper idea, while `block_run_index` records the run position inside that idea block
+- `show-blocks` summarizes completed and in-progress idea blocks for the active campaign
 - `artifact_path` is required for every non-crash row
 - crashes should still be logged with status `crash`, `val_ap 0`, and `params_k 0`; `run-and-log` handles that automatically
 - the test set must not be used during the campaign to choose which experiment to keep
@@ -250,13 +260,13 @@ uv run python prepare.py finalize-campaign-test --campaign-id paper-2505-11346-r
 `results.tsv` columns:
 
 ```text
-campaign_id	paper_label	experiment_num	commit	val_ap	params_k	status	short_caption	description	branch	log_path	artifact_path	timestamp
+campaign_id	paper_label	experiment_num	commit	val_ap	params_k	status	short_caption	description	block_id	block_label	block_run_index	block_size	block_role	seed_experiment_num	branch	log_path	artifact_path	timestamp
 ```
 
 `campaigns.tsv` columns:
 
 ```text
-campaign_id	paper_label	paper_url	baseline_ref	start_branch	target_experiments	created_at	notes	final_test_experiment_num	final_test_commit	final_test_ap	final_test_artifact_path	final_test_timestamp
+campaign_id	paper_label	paper_url	baseline_ref	start_branch	target_experiments	idea_block_size	created_at	notes	final_test_experiment_num	final_test_commit	final_test_ap	final_test_artifact_path	final_test_timestamp
 ```
 
 The root copies of `results.tsv` and `campaigns.tsv` are synced snapshots for convenience. The authoritative versions live in the shared state directory.

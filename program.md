@@ -78,42 +78,58 @@ If the environment uses `uv`, run the same commands through `uv run`.
 
 ## Experiment Discipline
 
-Every logged row should represent one conceptual experiment, not every inner candidate sweep.
-The next experiment should usually be chosen only after inspecting the previous result.
+Every logged row should represent one experiment execution, but a 50-run paper campaign should usually be organized into idea blocks rather than a flat sequence of tiny tweaks.
+The default campaign shape is one untouched baseline plus paper-aligned idea blocks of size 5.
+Each idea block should focus on one larger paper-derived mechanism and then tune that mechanism locally.
+The next larger idea should usually be chosen only after inspecting the results of the current block.
 Do not turn the campaign into a fixed 50-run hyperparameter grid unless the user explicitly asks for that.
-Even when the user asks to finish all 50 experiments, still work adaptively in small batches, inspect the newest evidence, and then choose the next batch. A request to complete the full campaign is not permission to predeclare the whole schedule or blindly queue dozens of runs from one initial guess.
+If the user's prompt says to run the full campaign, treat that as permission to continue until the target experiment count is reached unless the user explicitly interrupts or redirects the run.
 
 Within one active campaign:
 
 1. Run the untouched baseline first.
-2. Make the paper-driven change in [`train.py`](train.py) that currently seems most promising.
-3. Run `python prepare.py run-and-log --short-caption "<caption>" --description "<text>"`.
-4. Read the returned validation result, status, log path, and artifact path.
-5. Use the paper plus the latest results to decide the next change.
-6. Repeat until the campaign reaches its target experiment count, usually 50.
+2. Choose one larger paper-driven idea that is meaningfully different from previous blocks.
+3. Implement the seed version of that idea in [`train.py`](train.py).
+4. Log the seed run with `block_run_index 1` and `block_role seed`.
+5. Run up to four local follow-ups inside the same block, usually tuning layer count, width, learning rate, dropout, weight decay, batch size, or closely related settings for that same mechanism.
+6. After the block finishes, inspect the block outcome and choose the next larger paper idea.
+7. Repeat until the campaign reaches its target experiment count, usually 50.
+
+Default block pattern:
+
+- run 1 of the block: seed implementation of one larger idea
+- runs 2-5 of the block: local tuning around that same idea
+- block size defaults to 5 unless the campaign was created with a different `idea_block_size`
+- if a seed idea is clearly non-competitive, it is acceptable to stop that block early and move to a new larger idea rather than forcing all five runs
 
 Stay paper-aligned:
 
 - transfer the paper's central mechanism, normalization, routing, fusion, aggregation, or readout ideas
-- prefer larger architectural or training-process changes early when they are paper-motivated
-- use small paper-motivated sweeps only when they help refine a promising current idea
+- between blocks, prefer larger architectural or training-process changes that map to distinct paper ideas
+- within a block, use small paper-motivated sweeps only to refine the current larger idea
 - avoid unrelated architecture churn
 - never use test AP to choose the next experiment
 
 Avoid defaulting to a predeclared experiment catalog:
 
-- do not hardcode dozens of future experiment ids or configs and then execute them blindly
-- do not let automation choose future experiments without first considering the newest validation evidence
+- do not hardcode all 50 future experiments and then execute them blindly
+- do not let automation choose future idea blocks without first considering the newest validation evidence
 - helper scripts for setup or logging are fine, but they should not replace iterative research judgment
-- if a user explicitly asks for the whole campaign, prefer short adaptive batches with a brief checkpoint after each batch over one long unattended sweep
-- if you do run an inner sweep inside one experiment, keep it tightly scoped and describe the shared hypothesis in the logged row
+- if a user explicitly asks for the whole campaign, prefer block-by-block progress over one long unattended sweep
+- do not spend multiple blocks on tiny hyperparameter nudges unless one larger idea has already proved clearly dominant
 
 ## Logging
 
 Use the helper, never hand-edit TSV rows:
 
 ```bash
-python prepare.py run-and-log --short-caption "<caption>" --description "<text>"
+python prepare.py run-and-log \
+  --block-id "<idea-block-id>" \
+  --block-label "<larger paper idea>" \
+  --block-run-index 1 \
+  --block-role seed \
+  --short-caption "<caption>" \
+  --description "<text>"
 ```
 
 That command runs `train.py`, captures stdout/stderr to a log file, evaluates the recoverable checkpoint, and writes the ledger row without requiring ad hoc shell parsing.
@@ -122,14 +138,31 @@ Rules:
 
 - `short_caption` must be readable and at most 22 characters
 - `run-and-log` is the standard experiment entrypoint
+- `block_id` groups all runs belonging to the same larger paper idea
+- `block_label` should describe the larger idea in readable language
+- `block_run_index` should usually count from `1` to the campaign's `idea_block_size`, normally `5`
+- `block_role` should be `seed` for the first run in a block and `tune` for later runs
+- `seed_experiment_num` is auto-filled for the first run in a block and inherited by later runs when omitted
+- `show-blocks` summarizes which idea blocks have been logged so far
 - if training fails or times out, `run-and-log` should still write a `crash` row with `val_ap 0` and `params_k 0`
 - `artifact_path` is required for every non-crash row
 - the active campaign is taken from `results/current_campaign.json` unless `--campaign-id` is supplied
 
+Example follow-up run inside the same idea block:
+
+```bash
+python prepare.py run-and-log \
+  --block-id "<idea-block-id>" \
+  --block-run-index 2 \
+  --block-role tune \
+  --short-caption "<caption>" \
+  --description "<text>"
+```
+
 `results.tsv` columns:
 
 ```text
-campaign_id	paper_label	experiment_num	commit	val_ap	params_k	status	short_caption	description	branch	log_path	artifact_path	timestamp
+campaign_id	paper_label	experiment_num	commit	val_ap	params_k	status	short_caption	description	block_id	block_label	block_run_index	block_size	block_role	seed_experiment_num	branch	log_path	artifact_path	timestamp
 ```
 
 ## Final Test
@@ -145,7 +178,7 @@ That command selects the recoverable experiment with the highest validation AP a
 `campaigns.tsv` columns:
 
 ```text
-campaign_id	paper_label	paper_url	baseline_ref	start_branch	target_experiments	created_at	notes	final_test_experiment_num	final_test_commit	final_test_ap	final_test_artifact_path	final_test_timestamp
+campaign_id	paper_label	paper_url	baseline_ref	start_branch	target_experiments	idea_block_size	created_at	notes	final_test_experiment_num	final_test_commit	final_test_ap	final_test_artifact_path	final_test_timestamp
 ```
 
 ## Runtime Contract
